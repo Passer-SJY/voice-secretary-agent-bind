@@ -1,0 +1,6 @@
+node_modules/
+.voice-secretary-bind/
+invitation.json
+context.json
+receipt.json
+*.log
