@@ -52,7 +52,7 @@ export async function cli(args) {
   // Never carry an agent exec attribution into operator dispatch. Start this service
   // as an owner-controlled standalone process, not under an active agent turn.
   requireThat(args[0] !== 'agent' || process.env.OPENCLAW_SHELL !== 'exec', 'Start the bridge outside OpenClaw agent exec');
-  const { stdout } = await exec('openclaw', args, { timeout: 660000, maxBuffer: 2 * 1024 * 1024 });
+  const { stdout } = await exec(process.env.VS_OPENCLAW_BIN ?? 'openclaw', args, { timeout: 660000, maxBuffer: 2 * 1024 * 1024 });
   return JSON.parse(stdout);
 }
 export async function verifySession(binding, command = cli) {
@@ -88,18 +88,39 @@ export function interpretReply(raw) {
     ['failed','suppressed','partial_failed'].includes(d?.status) ? 'failed' : 'unknown';
   return { status: 'completed', execution: 'completed', delivery, output: text };
 }
+function acquireLock(root) {
+  // Serialize stale-lock inspection and replacement. A crash inside this short
+  // startup critical section leaves a guard and fails closed for owner review.
+  const guard = join(root, 'bridge-startup.guard'), lock = join(root, 'bridge.lock');
+  const guardFD = openSync(guard, 'wx', 0o600);
+  closeSync(guardFD);
+  try {
+    let old;
+    try { old = readFileSync(lock, 'utf8'); } catch (e) { if (e.code !== 'ENOENT') throw e; }
+    if (old !== undefined) {
+      const pid = Number(old.trim());
+      requireThat(Number.isSafeInteger(pid) && pid > 0, 'Invalid lock; owner review required');
+      try { process.kill(pid, 0); throw new Error('Bridge state is already owned'); }
+      catch (e) { if (e.code !== 'ESRCH') throw e; }
+      // Only a positively absent process permits removal of this one lock.
+      unlinkSync(lock);
+    }
+    const fd = openSync(lock, 'wx', 0o600);
+    try { writeFileSync(fd, String(process.pid)); fsyncSync(fd); } finally { closeSync(fd); }
+  } finally { unlinkSync(guard); }
+  return () => {
+    if (readFileSync(lock, 'utf8') === String(process.pid)) unlinkSync(lock);
+  };
+}
 export function createBridge(root, { command = cli, now = () => Date.now() } = {}) {
   init(root);
-  // Prevent two bridge processes and recovery from racing active work. A stale
-  // lock is intentionally a manual check; it never silently replays a task.
-  const lock = join(root, 'bridge.lock');
-  const fd = openSync(lock, 'wx', 0o600); writeFileSync(fd, String(process.pid)); closeSync(fd);
+  const releaseLock = acquireLock(root);
   try {
     for (const name of readdirSync(root).filter(n => /^run-[0-9a-f-]+\.json$/i.test(n))) {
       const r = read(root, name);
       if (r.status === 'running') write(root, name, { ...r, status: 'outcome_unknown', execution: 'unknown', delivery: 'unknown', output: 'Bridge restarted; check the original session. Request will not be replayed.' });
     }
-  } catch (e) { unlinkSync(lock); throw e; }
+  } catch (e) { releaseLock(); throw e; }
   const jobs = new Set(), activeSessions = new Set(); let closing = false;
   function response(res, code, body) {
     res.writeHead(code, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' }); res.end(JSON.stringify(body));
@@ -133,6 +154,9 @@ export function createBridge(root, { command = cli, now = () => Date.now() } = {
     try {
       if (closing) return response(res, 503, { error: 'shutting_down' });
       const path = new URL(req.url, 'http://localhost').pathname;
+      if (path === '/health' && req.method === 'GET') {
+        return response(res, 200, { service: 'voice-secretary-bridge', status: 'ready', version: VERSION });
+      }
       if (path === '/v1/pair' && req.method === 'POST') {
         const b = await body(req); requireThat(uuid.test(b.invitation_id) && hex.test(b.challenge));
         const invitation = read(root, 'invitation-' + b.invitation_id.toLowerCase() + '.json');
@@ -181,7 +205,7 @@ export function createBridge(root, { command = cli, now = () => Date.now() } = {
     } catch (e) { response(res, e.code === 'ENOENT' ? 404 : 400, { error: e.code === 'ENOENT' ? 'not_found' : 'invalid_request' }); }
   });
   server.headersTimeout = 15000; server.requestTimeout = 30000;
-  return { server, async close() { closing = true; await new Promise(done => server.close(done)); await Promise.allSettled([...jobs]); unlinkSync(lock); } };
+  return { server, async close() { closing = true; await new Promise(done => server.close(done)); await Promise.allSettled([...jobs]); releaseLock(); } };
 }
 async function main() {
   const [mode, ...args] = process.argv.slice(2), root = resolve(process.env.VS_BIND_STATE ?? join(homedir(), '.voice-secretary-bind'));

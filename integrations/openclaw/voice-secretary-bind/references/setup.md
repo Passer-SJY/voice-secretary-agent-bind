@@ -82,8 +82,7 @@ child merely to bypass OpenClaw restrictions. A supported owner-managed service
 starts independently of the turn. No root Gateway or credential changes are needed.
 
 Registration can run while the service is up. Graceful SIGTERM waits for active
-runs. An abrupt crash leaves `bridge.lock`; verify no process owns that state
-before removing this one lock. Never remove run journals. On restart, unfinished
+runs. An abrupt crash leaves `bridge.lock`; the safe recovery rules below apply. Never remove run journals. On restart, unfinished
 runs become `outcome_unknown` and are not executed again.
 
 ## Task and delivery semantics
@@ -117,3 +116,69 @@ Official references: [agent CLI](https://docs.openclaw.ai/cli/agent),
 [session CLI](https://docs.openclaw.ai/cli/sessions),
 [Feishu](https://docs.openclaw.ai/channels/feishu),
 [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve).
+
+
+## Persistent service and existing-binding upgrades
+
+Run the bridge and Tailscale on the always-on OpenClaw host, not inside a
+short-lived agent shell/container. Preserve the Tailscale daemon's state and
+node identity across restarts; an ephemeral or deleted node is unsuitable for
+this persistent binding. A node marked offline in Tailscale is a host networking
+condition, distinct from the loopback bridge process being stopped. Phone
+disconnection does not stop either independent host service.
+
+This package now includes an owner-run service helper. In the installed skill directory, prepare the configuration for owner review:
+
+```bash
+python3 scripts/service.py
+# Inspect the private generated unit/plist and its paths, then install it:
+python3 scripts/service.py --apply
+```
+
+Use `--node /absolute/node`, `--openclaw /absolute/openclaw`, `--state` and
+`--port` when the original installation uses custom paths. Keep the same state
+directory and port as the existing binding. The helper does not register a new
+binding, change Tailscale, alter credentials, stop an existing service or overwrite
+a different service configuration. It sets private state permissions and explicit
+executable paths. Linux uses a user systemd unit with restart supervision;
+macOS uses a LaunchAgent with KeepAlive. Linux boot without login requires the
+owner to enable lingering (`loginctl enable-linger` for that user); inspect the
+policy before changing it. A LaunchAgent starts after login; a sleeping or powered
+off host remains unavailable. Containers need persistent state volumes and a
+supervisor outside the agent turn; do not assume user systemd exists there.
+
+Check service status using `systemctl --user status voice-secretary-bridge` on
+Linux or `launchctl print gui/$(id -u)/org.folotoy.voice-secretary-bridge` on macOS.
+Check `http://127.0.0.1:8765/health` (adjust the port), then the existing Serve
+HTTPS endpoint. `/health` exposes only service readiness/version, no identities or
+credentials, and does not validate OpenClaw/Feishu delivery. Tailscale `serve --bg`
+persists its configuration but cannot keep a stopped daemon or bridge running.
+
+On startup, a stale `bridge.lock` is automatically replaced only after its stored
+PID is positively absent. Active, inaccessible or malformed owners are retained.
+Startup replacement is serialized with `bridge-startup.guard`; a guard left by a
+crash during this tiny section requires owner review. Never delete run journals.
+Recovered unfinished requests remain `outcome_unknown`, without replay. Stop or
+upgrade only after active tasks have been reconciled, and retain the original
+bindings, state path, HTTPS hostname, port and credentials.
+
+On iPhone, enable [VPN On Demand](https://tailscale.com/docs/features/client/ios-vpn-on-demand)
+in Tailscale settings if automatic connectivity is desired. Wi-Fi/cellular Always
+rules or supported `.ts.net` hostname matching can avoid routine manual reconnects.
+The app cannot override a disabled VPN or another active VPN. After connectivity
+returns, task Retry queries the durable original UUID. A missing run is resubmitted
+with exactly the same UUID/payload only after verifying the original binding;
+received or unknown work is not replayed. Confirmed failure creates a reviewed
+retry draft instead of silently repeating side effects.
+
+After reconciling active tasks, an already-loaded service needs an explicit
+restart to load upgraded code: `systemctl --user restart voice-secretary-bridge`
+or `launchctl kickstart -k gui/$(id -u)/org.folotoy.voice-secretary-bridge`. If the
+old bridge was a foreground process, stop that known process gracefully before
+installing its supervisor. Do not stop unrelated Node/OpenClaw processes.
+
+An installer running inside agent exec may prepare the configuration. With explicit
+host-owner approval, it may use `--apply --owner-approved` to ask the independent
+system process manager to start the service. The installer does not run the bridge
+as its child or strip `OPENCLAW_SHELL`; the system manager owns the new service.
+Without a usable independent manager, stop and report the missing host setup.

@@ -47,3 +47,12 @@ Feishu probe, then follow up in this conversation to verify context continuity.
 Task dispatch belongs to the app's explicit revision confirmation. Do not run a
 business task or start a probe automatically while binding. Missing delivery
 receipts mean unknown delivery. Interrupted runs must not be replayed.
+
+Before returning a successful setup receipt, verify an owner-managed persistent
+bridge service, persistent non-ephemeral Tailscale identity/state, loopback health
+and the existing HTTPS endpoint. Use the reviewed `scripts/service.py` helper
+with host-owner authorization; only the independent system manager may start
+the bridge, never an agent exec child with stripped attribution.
+For an existing binding, preserve its state and credentials; this operational
+upgrade does not require a new invitation or re-registration. Missing access to
+the host supervisor must be reported as pending deployment, not setup success.

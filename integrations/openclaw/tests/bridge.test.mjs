@@ -4,6 +4,8 @@ import { mkdtempSync, rmSync, readFileSync, writeFileSync, existsSync } from 'no
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
 import { createBridge, register, interpretReply, validateBinding, PROTOCOL } from '../voice-secretary-bind/scripts/bridge.mjs';
 const context = { accountID: 'fixture', chatID: 'oc_fixture', requesterID: 'ou_fixture', sessionKey: 'agent:main:feishu:direct:ou_fixture' };
 const invitation = () => ({ id: randomUUID(), challengeHash: createHash('sha256').update('a'.repeat(64)).digest('hex'), expires: new Date(Date.now() + 1800000).toISOString(), repository: 'https://github.com/fixture/fixture', revision: 'a'.repeat(40) });
@@ -88,4 +90,37 @@ test('successful execution never implies successful Feishu delivery', () => {
   assert.equal(interpretReply({ ok: false, result: sent.result }).status, 'outcome_unknown');
   assert.equal(interpretReply({ deliveryStatus: { status: 'sent', succeeded: true } }).status, 'outcome_unknown');
   assert.throws(() => validateBinding({ ...context, id: randomUUID(), skillVersion: '1.0.0', channel: 'feishu', sessionKey: 'agent:main:feishu:group:oc_other' }));
+});
+
+test('dead-process lock recovers without replay; live or invalid owner is retained', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vs-bind-crash-'));
+  let child, bridge;
+  try {
+    const moduleURL = new URL('../voice-secretary-bind/scripts/bridge.mjs', import.meta.url).href;
+    child = spawn(process.execPath, ['--input-type=module', '-e',
+      `import {createBridge} from ${JSON.stringify(moduleURL)}; const b=createBridge(${JSON.stringify(root)}); b.server.listen(0,'127.0.0.1',()=>console.log('ready'));`],
+      { stdio: ['ignore', 'pipe', 'pipe'] });
+    await once(child.stdout, 'data');
+    assert.throws(() => createBridge(root));
+    assert.equal(readFileSync(join(root, 'bridge.lock'), 'utf8'), String(child.pid));
+    const id = randomUUID();
+    writeFileSync(join(root, 'run-' + id + '.json'), JSON.stringify({ run_id: id, status: 'running' }));
+    const exited = once(child, 'exit'); child.kill('SIGKILL'); await exited;
+    let calls = 0;
+    bridge = createBridge(root, { command: async () => { calls++; throw new Error('Never replay'); } });
+    const journal = JSON.parse(readFileSync(join(root, 'run-' + id + '.json'), 'utf8'));
+    assert.equal(journal.status, 'outcome_unknown'); assert.equal(calls, 0);
+    await new Promise(done => bridge.server.listen(0, '127.0.0.1', done));
+    const response = await fetch('http://127.0.0.1:' + bridge.server.address().port + '/health');
+    assert.deepEqual(await response.json(), { service: 'voice-secretary-bridge', status: 'ready', version: '1.0.0' });
+    await bridge.close(); bridge = undefined;
+    writeFileSync(join(root, 'bridge.lock'), 'invalid');
+    assert.throws(() => createBridge(root));
+    assert.equal(readFileSync(join(root, 'bridge.lock'), 'utf8'), 'invalid');
+    assert.ok(existsSync(join(root, 'run-' + id + '.json')));
+  } finally {
+    if (child?.exitCode === null && child?.signalCode === null) child.kill('SIGKILL');
+    if (bridge) await bridge.close();
+    rmSync(root, { recursive: true, force: true });
+  }
 });

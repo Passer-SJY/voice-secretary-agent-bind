@@ -70,7 +70,7 @@ Linux 使用用户 systemd 服务，macOS 使用 LaunchAgent，配置绝对 Node
 主机拥有者服务，不需要 root Gateway 或修改 Gateway 密钥。
 
 服务运行时可以注册绑定。正常 SIGTERM 会等待活动请求；突然崩溃会留下
-`bridge.lock`，确认没有进程拥有该状态目录后，仅删除此锁。不能删除请求日志。
+`bridge.lock`，按下方安全恢复规则处理。不能删除请求日志。
 重启后未结束的请求转为 `outcome_unknown`，不再执行。
 
 ## 任务与投递语义
@@ -98,3 +98,58 @@ feishu --reply-account ... --reply-to chat:... --json`。OpenClaw 原生路由�
 [会话 CLI](https://docs.openclaw.ai/cli/sessions)、
 [飞书](https://docs.openclaw.ai/channels/feishu)、
 [Tailscale Serve](https://tailscale.com/docs/features/tailscale-serve)。
+
+
+## 持久服务与已有绑定升级
+
+Bridge 与 Tailscale 应运行在长期在线的 OpenClaw 主机上，不能依赖短命的 Agent
+shell/容器。Tailscale 守护进程的状态与节点身份必须跨重启保存；临时或已删除
+节点不适合持久绑定。Tailscale 节点离线属于主机网络状态，与回环 Bridge 进程
+停止不同；手机断线本身不会停止这两个独立主机服务。
+
+安装包现提供主机所有者执行的服务工具。在已安装 skill 目录中先准备配置供所有者核对：
+
+```bash
+python3 scripts/service.py
+# 检查私有生成的 unit/plist 与路径，再安装：
+python3 scripts/service.py --apply
+```
+
+原安装使用定制路径时，指定 `--node /绝对路径/node`、
+`--openclaw /绝对路径/openclaw`、`--state` 和 `--port`。必须沿用原绑定的状态
+目录和端口。工具不会注册新绑定、修改 Tailscale、改变凭证、停止现有服务或
+覆盖不同的服务配置。它设置私有目录权限和明确的可执行路径。Linux 使用有
+自动重启的 systemd 用户服务；macOS 使用 KeepAlive LaunchAgent。Linux 无
+登录开机运行需要所有者启用用户 lingering（该用户的 `loginctl enable-linger`），
+先核对策略再修改。LaunchAgent 在用户登录后启动；主机休眠或关机仍不可用。
+容器需要持久状态卷和 Agent 回合外的进程管理器，不能假设容器有用户 systemd。
+
+Linux 用 `systemctl --user status voice-secretary-bridge` 查看服务；macOS 用
+`launchctl print gui/$(id -u)/org.folotoy.voice-secretary-bridge`。检查本机
+`http://127.0.0.1:8765/health`（按实际端口调整），再核对已有 Serve HTTPS
+入口。`/health` 只公开服务就绪与版本，不包含身份或凭证，也不证明飞书回传。
+Tailscale `serve --bg` 会保留配置，但不能让已经停止的守护进程或 Bridge 运行。
+
+启动时，只有明确确认 `bridge.lock` 中 PID 已不存在，才自动替换遗留锁；
+存活、不可检查或格式错误的拥有者仍保留。启动替换通过 `bridge-startup.guard`
+串行化；极短启动临界区内崩溃留下的 guard 需要所有者核对。不能删除请求
+日志；恢复后的未完成请求仍为 `outcome_unknown`，不会重放。升级或停止前
+先核对活动任务，并保留原绑定、状态路径、HTTPS 域名、端口和凭证。
+
+iPhone 可在 Tailscale 设置开启
+[VPN On Demand](https://tailscale.com/docs/features/client/ios-vpn-on-demand)
+自动连接。Wi-Fi/蜂窝 Always 规则或支持的 `.ts.net` 域名匹配可减少手动重连。
+App 无法覆盖手动禁用的 VPN 或其他正在运行的 VPN。连接恢复后，任务“重试”
+先查询原 UUID；只有原绑定核验通过且请求不存在时，才用同 UUID/内容恢复
+派发。已接收或结果不明的任务不重跑；确定失败则生成需核对的重试草稿。
+
+核对活动任务后，已有服务需明确重启才会加载升级代码：
+`systemctl --user restart voice-secretary-bridge`，或
+`launchctl kickstart -k gui/$(id -u)/org.folotoy.voice-secretary-bridge`。
+原 Bridge 若在前台运行，先正常停止确认过的该进程，再安装进程管理器。
+不能停止不相关的 Node/OpenClaw 进程。
+
+Agent exec 中的安装工具可以准备配置；获得明确主机所有者授权后，可以使用
+`--apply --owner-approved` 请求独立的系统进程管理器启动服务。安装器不会将
+Bridge 作为自己的子进程运行，也不会删除 `OPENCLAW_SHELL`；新服务归系统
+管理器所有。没有可用的独立进程管理器时，应停止并说明缺少主机部署条件。
