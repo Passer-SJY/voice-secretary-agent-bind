@@ -182,3 +182,5 @@ host-owner approval, it may use `--apply --owner-approved` to ask the independen
 system process manager to start the service. The installer does not run the bridge
 as its child or strip `OPENCLAW_SHELL`; the system manager owns the new service.
 Without a usable independent manager, stop and report the missing host setup.
+
+Docker without a user systemd manager uses [the dedicated container route](docker.md). Apply now checks manager availability before installing files.

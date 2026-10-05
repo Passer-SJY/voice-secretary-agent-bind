@@ -153,3 +153,5 @@ Agent exec 中的安装工具可以准备配置；获得明确主机所有者授
 `--apply --owner-approved` 请求独立的系统进程管理器启动服务。安装器不会将
 Bridge 作为自己的子进程运行，也不会删除 `OPENCLAW_SHELL`；新服务归系统
 管理器所有。没有可用的独立进程管理器时，应停止并说明缺少主机部署条件。
+
+没有 systemd 用户实例的 Docker 使用[专用容器方案](docker.zh_CN.md)；apply 现在先检查管理器可用性，再安装文件。

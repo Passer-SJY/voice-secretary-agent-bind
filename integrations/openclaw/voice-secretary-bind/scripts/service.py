@@ -65,6 +65,12 @@ def main():
     args = parser.parse_args()
     if args.apply and os.environ.get('OPENCLAW_SHELL') == 'exec' and not args.owner_approved:
         raise ValueError('Installation from agent exec requires explicit owner authorization (--owner-approved)')
+    if args.apply and sys.platform == 'linux':
+        usable = shutil.which('systemctl') and subprocess.run(
+            ['systemctl', '--user', 'show-environment'], stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL).returncode == 0
+        if not usable:
+            raise ValueError('No user systemd manager. Use references/docker.md and scripts/container.py; no service files were installed')
     def executable(explicit, name):
         value = explicit or shutil.which(name)
         if not value or not os.access(value, os.X_OK):

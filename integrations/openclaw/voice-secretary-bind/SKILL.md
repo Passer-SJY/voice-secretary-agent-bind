@@ -56,3 +56,5 @@ the bridge, never an agent exec child with stripped attribution.
 For an existing binding, preserve its state and credentials; this operational
 upgrade does not require a new invitation or re-registration. Missing access to
 the host supervisor must be reported as pending deployment, not setup success.
+
+For a Docker runtime without systemd, read [Docker recovery](references/docker.md) and use the stopped-state migration/Compose helpers. Require actual host deployment access; do not claim deployment from inside an isolated container.
