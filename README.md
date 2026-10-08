@@ -25,3 +25,7 @@ conversation routing and separate execution/message-delivery outcomes.
 Synthetic contract tests do not validate a real OpenClaw installation, tailnet,
 Feishu send, or follow-up context. Those checks remain required. Publication and
 host service installation are separate from local build validation.
+
+## Planning and selected projects
+
+The package now includes [phone planning snapshots and proposals](integrations/openclaw/voice-secretary-bind/references/planning.md), including opt-in read-only project context. Keep existing Docker volumes, binding credentials and Tailscale identity when upgrading. Selected calendar/reminder mutations still require phone review; project items cannot be directly modified by this Bridge. Publication is not proof of remote deployment or phone acceptance.

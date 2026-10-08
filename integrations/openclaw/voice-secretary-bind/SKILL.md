@@ -58,3 +58,7 @@ upgrade does not require a new invitation or re-registration. Missing access to
 the host supervisor must be reported as pending deployment, not setup success.
 
 For a Docker runtime without systemd, read [Docker recovery](references/docker.md) and use the stopped-state migration/Compose helpers. Require actual host deployment access; do not claim deployment from inside an isolated container.
+
+## Phone planning integration
+
+Read [planning snapshots and proposals](references/planning.md) before accessing phone calendar/reminder data. Only use the current bound snapshot, respect its scope and age, and queue reviewed proposals; submission is not execution or proof of completion.

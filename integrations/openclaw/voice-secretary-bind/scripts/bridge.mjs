@@ -112,6 +112,36 @@ function acquireLock(root) {
     if (readFileSync(lock, 'utf8') === String(process.pid)) unlinkSync(lock);
   };
 }
+const PLANNING = 'voice-secretary-planning/v1';
+const planningFile = id => 'planning-' + id.toLowerCase() + '.json';
+const proposalFile = (binding, id) => 'proposal-' + binding.toLowerCase() + '-' + id.toLowerCase() + '.json';
+const maybeRead = (root, name) => { try { return read(root, name); } catch (e) { if (e.code === 'ENOENT') return null; throw e; } };
+export function readPlanning(root, bindingID, offset = 0, limit = 100) {
+  requireThat(uuid.test(bindingID) && Number.isInteger(offset) && offset >= 0 && Number.isInteger(limit) && limit > 0 && limit <= 100);
+  const snapshot = read(root, planningFile(bindingID));
+  const { items, ...metadata } = snapshot;
+  return { ...metadata, items: items.slice(offset, offset + limit), total: items.length, nextOffset: offset + limit < items.length ? offset + limit : null };
+}
+export function proposePlanning(root, bindingID, proposal) {
+  requireThat(uuid.test(bindingID) && uuid.test(proposal.id) && ['schedule','reminder'].includes(proposal.kind) && ['create','edit','complete','delete'].includes(proposal.operation));
+  requireThat(typeof proposal.containerID === 'string' && proposal.containerID.length <= 200 && proposal.change && typeof proposal.change === 'object');
+  const binding = read(root, bindFile(bindingID)); requireThat(binding.claimed, 'Binding is not claimed');
+  const name = proposalFile(bindingID, proposal.id), old = maybeRead(root, name), fingerprint = hash(canonical(proposal));
+  if (old) { requireThat(old.fingerprint === fingerprint, 'Operation UUID conflict'); return { proposal: old.proposal, state: old.state, message: old.message }; }
+  const snapshot = read(root, planningFile(bindingID));
+  const containers = proposal.kind === 'schedule' ? snapshot.calendarIDs : snapshot.reminderListIDs;
+  requireThat(containers.includes(proposal.containerID), 'Destination is not shared');
+  if (proposal.operation !== 'create') {
+    const item = snapshot.items.find(x => x.id === proposal.itemID);
+    requireThat(item && item.kind === proposal.kind && item.containerID === proposal.containerID && item.revision === proposal.expectedRevision && item.writable && !item.recurring, 'Item changed or is not writable');
+  } else requireThat(proposal.itemID == null && proposal.expectedRevision == null, 'Create must not reuse an item');
+  requireThat(proposal.kind === 'reminder' || proposal.operation !== 'complete');
+  requireThat(JSON.stringify(proposal).length <= 16000);
+  const pending = readdirSync(root).filter(n => n.startsWith('proposal-' + bindingID.toLowerCase() + '-')).map(n => read(root,n)).filter(x => x.state === 'received').length;
+  requireThat(pending < 100, 'Too many pending proposals');
+  write(root, name, { proposal, state: 'received', fingerprint }, true);
+  return { proposal, state: 'received' };
+}
 export function createBridge(root, { command = cli, now = () => Date.now() } = {}) {
   init(root);
   const releaseLock = acquireLock(root);
@@ -166,6 +196,70 @@ export function createBridge(root, { command = cli, now = () => Date.now() } = {
         if (!record.claimed) { record.claimed = true; write(root, bindFile(record.binding.id), record); }
         return response(res, 200, { protocolVersion: PROTOCOL, invitationID: record.invitationID, binding: record.binding, accessToken: record.accessToken });
       }
+      const planning = path.match(/^\/v1\/bindings\/([0-9a-f-]+)\/planning(?:\/(snapshots|proposals)(?:\/([0-9a-f-]+)\/receipt)?)?$/i);
+      if (planning && uuid.test(planning[1])) {
+        const bindingID = planning[1].toLowerCase(), record = read(root, bindFile(bindingID));
+        if (!credentials(req, record)) return response(res, 403, { error: 'unauthorized' });
+        if (req.method === 'POST' && planning[2] === 'snapshots') {
+          const b = await body(req);
+          requireThat(b.protocolVersion === PLANNING && uuid.test(b.snapshotID) && uuid.test(b.authorityID) && Number.isSafeInteger(b.generation) && b.generation > 0);
+          requireThat(Number.isInteger(b.page) && Number.isInteger(b.pages) && b.pages > 0 && b.pages <= 500 && b.page >= 0 && b.page < b.pages && Array.isArray(b.items) && b.items.length <= 20);
+          for (const key of ['calendarIDs','reminderListIDs']) requireThat(Array.isArray(b[key]) && b[key].length <= 100 && b[key].every(x => typeof x === 'string' && x.length <= 200) && new Set(b[key]).size === b[key].length);
+          const projectIDs = b.projectIDs ?? [], projects = b.projects ?? [];
+          requireThat(Array.isArray(projectIDs) && projectIDs.length <= 100 && projectIDs.every(x => uuid.test(x)) && new Set(projectIDs.map(x => x.toLowerCase())).size === projectIDs.length);
+          requireThat(Array.isArray(projects) && projects.length === projectIDs.length && new Set(projects.map(p => p.id?.toLowerCase())).size === projects.length && projects.every(p => uuid.test(p.id) && projectIDs.some(id => id.toLowerCase() === p.id.toLowerCase()) && typeof p.name === 'string' && p.name.length > 0 && p.name.length <= 100 && typeof p.details === 'string' && p.details.length <= 2000 && Number.isSafeInteger(p.revision) && p.revision > 0));
+          const sharedPlacement = p => p && (p.bucket === 'project' ? uuid.test(p.projectID) && projectIDs.some(id => id.toLowerCase() === p.projectID.toLowerCase()) : p.projectID == null && (p.bucket === 'everyday' && b.shareEveryday === true || p.bucket === 'unclassified' && b.shareUnclassified === true));
+          for (const item of b.items) {
+            requireThat(item && typeof item.id === 'string' && item.id.length <= 500 && ['schedule','reminder','app-item'].includes(item.kind) && typeof item.revision === 'string' && item.revision.length <= 100 && typeof item.title === 'string' && item.title.length <= 500 && (item.notes == null || typeof item.notes === 'string' && item.notes.length <= 4000));
+            if (item.kind === 'app-item') requireThat(sharedPlacement(item.projectPlacement) && item.writable === false && uuid.test(item.appTaskID) && item.id === 'app:' + item.appTaskID.toLowerCase() && ['task','todo','schedule'].includes(item.appKind) && Number.isSafeInteger(item.appRevision) && item.appRevision > 0 && item.containerID === 'project:' + (item.projectPlacement.projectID?.toLowerCase() ?? item.projectPlacement.bucket));
+            else requireThat((item.kind === 'schedule' ? b.calendarIDs : b.reminderListIDs).includes(item.containerID));
+            if (item.projectPlacement != null) requireThat(sharedPlacement(item.projectPlacement), 'Project is not shared');
+            if (item.projectName != null) requireThat(typeof item.projectName === 'string' && item.projectName.length <= 100);
+          }
+          const latest = maybeRead(root, planningFile(bindingID));
+          if (latest && (latest.authorityID !== b.authorityID || latest.generation > b.generation || latest.generation === b.generation && latest.snapshotID !== b.snapshotID)) return response(res, 409, { error: 'stale_snapshot' });
+          const name = 'planning-upload-' + bindingID + '-' + b.snapshotID.toLowerCase() + '.json';
+          const staged = readdirSync(root).filter(n => n.startsWith('planning-upload-' + bindingID + '-'));
+          for (const stagedName of staged) {
+            const old = read(root, stagedName).metadata;
+            requireThat(old.authorityID === b.authorityID, 'Snapshot authority conflict');
+            if (old.generation > b.generation || old.generation === b.generation && old.snapshotID !== b.snapshotID) return response(res, 409, { error: 'stale_snapshot' });
+            if (old.generation < b.generation) { try { unlinkSync(join(root, stagedName)); } catch {} }
+          }
+          const { items, page, ...metadata } = b;
+          const upload = maybeRead(root, name) ?? { metadata, pages: {} };
+          requireThat(canonical(upload.metadata) === canonical(metadata), 'Snapshot metadata conflict');
+          if (upload.pages[page]) requireThat(canonical(upload.pages[page]) === canonical(items), 'Snapshot page conflict');
+          upload.pages[page] = items; write(root, name, upload);
+          if (Object.keys(upload.pages).length === b.pages) {
+            const all = Array.from({length:b.pages}, (_,i) => upload.pages[i]).flat();
+            requireThat(new Set(all.map(x => x.id)).size === all.length, 'Duplicate planning IDs');
+            write(root, planningFile(bindingID), { ...metadata, receivedAt: new Date(now()).toISOString(), items: all });
+            for (const stagedName of readdirSync(root).filter(n => n.startsWith('planning-upload-' + bindingID + '-'))) {
+              const pending = maybeRead(root, stagedName);
+              if (pending?.metadata.authorityID === b.authorityID && pending.metadata.generation <= b.generation) { try { unlinkSync(join(root, stagedName)); } catch {} }
+            }
+          }
+          return response(res, 200, { accepted: true, generation: b.generation });
+        }
+        if (req.method === 'GET' && !planning[2]) {
+          const query = new URL(req.url, 'http://localhost').searchParams;
+          return response(res, 200, readPlanning(root, bindingID, Number(query.get('offset') ?? 0), Number(query.get('limit') ?? 100)));
+        }
+        if (req.method === 'POST' && planning[2] === 'proposals' && !planning[3]) return response(res, 200, proposePlanning(root, bindingID, await body(req)));
+        if (req.method === 'GET' && planning[2] === 'proposals') {
+          const proposals = readdirSync(root).filter(n => n.startsWith('proposal-' + bindingID + '-')).map(n => read(root,n)).filter(x => x.state === 'received').map(x => x.proposal);
+          return response(res, 200, { proposals });
+        }
+        if (req.method === 'POST' && planning[2] === 'proposals' && uuid.test(planning[3])) {
+          const b = await body(req), name = proposalFile(bindingID, planning[3]), old = read(root, name);
+          requireThat(['applied','rejected','conflict'].includes(b.state) && (b.message == null || typeof b.message === 'string' && b.message.length <= 500));
+          if (old.state !== 'received') requireThat(old.state === b.state, 'Terminal receipt conflict');
+          write(root, name, { ...old, state: b.state, message: b.message ?? null });
+          return response(res, 200, { accepted: true });
+        }
+        return response(res, 405, { error: 'method_not_allowed' });
+      }
       const m = path.match(/^\/v1\/bindings\/([0-9a-f-]+)(?:\/runs(?:\/([0-9a-f-]+))?)?$/i);
       if (!m || !uuid.test(m[1])) return response(res, 404, { error: 'not_found' });
       const record = read(root, bindFile(m[1]));
@@ -215,7 +309,14 @@ async function main() {
     // The only intentional secret output is the short-lived receipt for the user.
     console.log(JSON.stringify(receipt)); return;
   }
-  requireThat(mode === 'serve', 'Use register or serve');
+  if (mode === 'planning-read') {
+    console.log(JSON.stringify(readPlanning(root, args[0], Number(args[1] ?? 0), Number(args[2] ?? 100)))); return;
+  }
+  if (mode === 'planning-propose') {
+    requireThat(args.length === 2, 'planning-propose BINDING_UUID PROPOSAL.json');
+    console.log(JSON.stringify(proposePlanning(root, args[0], JSON.parse(readFileSync(args[1], 'utf8'))))); return;
+  }
+  requireThat(mode === 'serve', 'Use register, serve, planning-read or planning-propose');
   requireThat(process.env.OPENCLAW_SHELL !== 'exec', 'Run the bridge as an owner-managed service outside agent exec');
   const port = Number(process.env.VS_BIND_PORT ?? 8765); requireThat(Number.isInteger(port) && port > 1024 && port <= 65535);
   const bridge = createBridge(root);

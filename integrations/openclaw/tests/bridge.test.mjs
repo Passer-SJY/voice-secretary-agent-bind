@@ -6,7 +6,7 @@ import { join } from 'node:path';
 import { randomUUID, createHash } from 'node:crypto';
 import { spawn } from 'node:child_process';
 import { once } from 'node:events';
-import { createBridge, register, interpretReply, validateBinding, PROTOCOL } from '../voice-secretary-bind/scripts/bridge.mjs';
+import { createBridge, register, interpretReply, validateBinding, PROTOCOL, readPlanning, proposePlanning } from '../voice-secretary-bind/scripts/bridge.mjs';
 const context = { accountID: 'fixture', chatID: 'oc_fixture', requesterID: 'ou_fixture', sessionKey: 'agent:main:feishu:direct:ou_fixture' };
 const invitation = () => ({ id: randomUUID(), challengeHash: createHash('sha256').update('a'.repeat(64)).digest('hex'), expires: new Date(Date.now() + 1800000).toISOString(), repository: 'https://github.com/fixture/fixture', revision: 'a'.repeat(40) });
 const baseURL = 'https://fixture.fixture.ts.net:8443/v1';
@@ -123,4 +123,75 @@ test('dead-process lock recovers without replay; live or invalid owner is retain
     if (bridge) await bridge.close();
     rmSync(root, { recursive: true, force: true });
   }
+});
+
+
+test('planning scopes, atomic pages, stale snapshots, reviewed proposals and durable receipts', async () => {
+  const root = mkdtempSync(join(tmpdir(), 'vs-planning-'));
+  let bridge;
+  const command = async args => { assert.equal(args[0], 'sessions', 'Planning must not execute or send a business message'); return { sessions: [{ key: context.sessionKey }] }; };
+  try {
+    const invite = invitation(), receipt = await register(root, invite, context, baseURL, command);
+    bridge = createBridge(root, { command });
+    await new Promise(done => bridge.server.listen(0, '127.0.0.1', done));
+    let origin = 'http://127.0.0.1:' + bridge.server.address().port;
+    const request = async (path, key, body) => {
+      const response = await fetch(origin + path, { method: body === undefined ? 'GET' : 'POST', headers: { Authorization: 'Bearer ' + key, 'Content-Type': 'application/json' }, ...(body === undefined ? {} : { body: JSON.stringify(body) }) });
+      return [response.status, await response.json()];
+    };
+    const [, paired] = await request('/v1/pair', receipt.pairingToken, { invitation_id: invite.id, challenge: 'a'.repeat(64) });
+    const key = paired.accessToken, path = '/v1/bindings/' + receipt.binding.id + '/planning';
+    const snapshot = { protocolVersion: 'voice-secretary-planning/v1', snapshotID: randomUUID(), authorityID: randomUUID(), generation: 1, calendarIDs: ['cal'], reminderListIDs: ['list'], pages: 2 };
+    const item = { id: 'reminder:fixture', kind: 'reminder', revision: 'revision-1', title: 'Fixture', containerID: 'list', writable: true, recurring: false, completed: false };
+    assert.equal((await request(path + '/snapshots', 'wrong', { ...snapshot, page: 0, items: [item] }))[0], 403);
+    assert.equal((await request(path + '/snapshots', key, { ...snapshot, page: 1, items: [] }))[0], 200);
+    assert.equal((await request(path, key))[0], 404, 'Partial uploads are not visible');
+    assert.equal((await request(path + '/snapshots', key, { ...snapshot, page: 0, items: [item] }))[0], 200);
+    assert.equal(readPlanning(root, receipt.binding.id).items.length, 1);
+    assert.equal(readPlanning(root, receipt.binding.id).total, 1);
+    assert.equal((await request(path + '/snapshots', key, { ...snapshot, snapshotID: randomUUID(), page: 0, items: [] }))[0], 409);
+    // Interrupted uploads must not accumulate into a permanent retry lockout.
+    for (let generation = 2; generation <= 14; generation++) {
+      assert.equal((await request(path + '/snapshots', key, { ...snapshot, snapshotID: randomUUID(), generation, page: 1, items: [] }))[0], 200);
+      assert.equal(readPlanning(root, receipt.binding.id).generation, 1);
+    }
+    assert.equal((await request(path + '/snapshots', key, { ...snapshot, snapshotID: randomUUID(), generation: 13, page: 0, items: [item] }))[0], 409);
+    assert.equal((await request(path + '/snapshots', key, { ...snapshot, snapshotID: randomUUID(), generation: 15, pages: 1, page: 0, items: [item] }))[0], 200);
+    const proposal = { id: randomUUID(), kind: 'reminder', operation: 'complete', itemID: item.id, expectedRevision: item.revision, containerID: 'list', change: { completed: true } };
+    assert.equal(proposePlanning(root, receipt.binding.id, proposal).state, 'received');
+    assert.equal(proposePlanning(root, receipt.binding.id, proposal).state, 'received');
+    assert.throws(() => proposePlanning(root, receipt.binding.id, { ...proposal, change: { completed: false } }));
+    assert.throws(() => proposePlanning(root, receipt.binding.id, { ...proposal, id: randomUUID(), expectedRevision: 'stale' }));
+    assert.throws(() => proposePlanning(root, receipt.binding.id, { ...proposal, id: randomUUID(), containerID: 'private' }));
+    assert.equal((await request(path + '/proposals', key))[1].proposals.length, 1);
+    assert.equal((await request(path + '/proposals/' + proposal.id + '/receipt', key, { state: 'applied', message: 'Fixture applied' }))[0], 200);
+    assert.equal((await request(path + '/proposals/' + proposal.id + '/receipt', key, { state: 'applied' }))[0], 200);
+    assert.equal((await request(path + '/proposals/' + proposal.id + '/receipt', key, { state: 'rejected' }))[0], 400);
+    assert.equal((await request(path + '/proposals', key))[1].proposals.length, 0);
+    await bridge.close(); bridge = createBridge(root, { command });
+    assert.equal(readPlanning(root, receipt.binding.id).items[0].id, item.id);
+    assert.equal(proposePlanning(root, receipt.binding.id, proposal).state, 'applied');
+    const projectID = randomUUID(), taskID = randomUUID();
+    const projectSnapshot = { ...snapshot, generation: 16, snapshotID: randomUUID(), pages: 1, page: 0,
+      projectIDs: [projectID], projects: [{ id: projectID, name: 'Website', details: 'Homepage', revision: 1 }],
+      items: [{ id: 'app:' + taskID, kind: 'app-item', revision: 'r1', title: 'Research', notes: 'Public fixture',
+        containerID: 'project:' + projectID, writable: false, recurring: false, appTaskID: taskID, appKind: 'task', appRevision: 1,
+        projectPlacement: { bucket: 'project', projectID }, projectName: 'Website' }] };
+    await new Promise(done => bridge.server.listen(0, '127.0.0.1', done));
+    origin = 'http://127.0.0.1:' + bridge.server.address().port;
+    assert.equal((await request(path + '/snapshots', key, projectSnapshot))[0], 200);
+    const projectRead = readPlanning(root, receipt.binding.id);
+    assert.equal(projectRead.projects[0].id, projectID); assert.equal(projectRead.items[0].writable, false);
+    assert.throws(() => proposePlanning(root, receipt.binding.id, { id: randomUUID(), kind: 'app-item', operation: 'complete', containerID: 'project:' + projectID, change: { completed: true } }));
+    const invalidProject = { ...projectSnapshot, generation: 17, snapshotID: randomUUID(), projectIDs: [], projects: [] };
+    assert.equal((await request(path + '/snapshots', key, invalidProject))[0], 400);
+    assert.equal(readPlanning(root, receipt.binding.id).generation, 16);
+    const revoked = { ...snapshot, generation: 17, snapshotID: randomUUID(), pages: 1, page: 0, items: [], calendarIDs: [], reminderListIDs: [] };
+    // Read/propose are also available to the container-local bound Skill.
+    origin = 'http://127.0.0.1:' + bridge.server.address().port;
+    assert.equal((await request(path + '/snapshots', key, revoked))[0], 200);
+    assert.equal(readPlanning(root, receipt.binding.id).total, 0);
+    assert.equal(proposePlanning(root, receipt.binding.id, proposal).state, 'applied');
+    assert.throws(() => proposePlanning(root, receipt.binding.id, { ...proposal, id: randomUUID() }));
+  } finally { if (bridge) await bridge.close(); rmSync(root, { recursive: true, force: true }); }
 });

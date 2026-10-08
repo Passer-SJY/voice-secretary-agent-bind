@@ -23,3 +23,7 @@ App 生成 30 分钟邀请，再导入目标飞书会话返回的 JSON 回执，
 
 模拟协议测试不能代替真实 OpenClaw 安装、tailnet 连接、飞书投递或上下文追问
 验收，这些仍需实测。仓库发布和主机服务安装与本地编译验证分别进行。
+
+## 规划与选定项目
+
+本包现包含[手机规划快照与提案](integrations/openclaw/voice-secretary-bind/references/planning.zh_CN.md)，支持明确开启的只读项目上下文。升级时保留既有 Docker 持久卷、绑定凭证和 Tailscale 身份。所选日历/提醒变更仍需手机审核；Bridge 不直接修改项目事项。公开发布不代表远端部署或手机验收已完成。
